@@ -108,11 +108,9 @@ def scraper_article_bdm(url, session=None, verbose=False):
     base_url = response.url
     soup = BeautifulSoup(response.text, "html.parser")
 
-    # Supprimer les scripts et styles pour avoir un contenu propre
     for script in soup(["script", "style"]):
         script.decompose()
 
-    # Trouver la zone principale de l'article
     article = soup.find("article")
     if not article:
         article = soup.find("main")
