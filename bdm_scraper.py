@@ -1,517 +1,407 @@
 import requests
 import re
 from bs4 import BeautifulSoup
-from bs4.element import NavigableString
 from urllib.parse import urljoin
 from datetime import datetime
 from dateutil import parser as dateutil_parser
 from pymongo import MongoClient, ASCENDING
 import time
 
-# --- Configuration MongoDB ---
+# Configuration de la base de données
 MONGO_URI = "mongodb://localhost:27017/"
 DB_NAME = "bdm_db"
 COLLECTION = "articles"
 
+# Connexion à MongoDB
 client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
 articles_col = db[COLLECTION]
-# create an index to avoid duplicates (by url)
 articles_col.create_index([("url", ASCENDING)], unique=True, sparse=True)
 
+#-------------------------------------------------------------------------------------------------------------------
 
-# --- Helpers ---
+def nettoyer_texte(texte):
+    """Nettoie et normalise le texte"""
+    if not texte:
+        return ""
+    texte = re.sub(r'\s+', ' ', texte.strip())
+    texte = re.sub(r'[\u00A0\u2000-\u200B\u2028\u2029]', ' ', texte)
+    return texte.strip()
 
-def _first_nonempty_text(el):
-    """Extract first non-empty text from element."""
-    if not el:
-        return None
-    txt = el.get_text(strip=True)
-    return txt if txt else None
+#-------------------------------------------------------------------------------------------------------------------
 
-def _get_img_url(img_tag, base_url):
-    """Get image URL from various possible attributes."""
+def extraire_url_image(img_tag, base_url):
+    """Récupère l'URL d'une image depuis ses attributs"""
     if not img_tag:
         return None
     
-    for attr in ["data-src", "data-lazy-src", "data-original", "src", "data-srcset"]:
+    attributs = ["data-src", "data-lazy-src", "data-original", "src", "data-srcset"]
+    
+    for attr in attributs:
         url = img_tag.get(attr)
         if url:
-            # if srcset, pick first url
-            if attr == "data-srcset" or "," in url:
+            if "," in url:  # cas des srcset avec plusieurs tailles
                 url = url.split(",")[0].split()[0]
             return urljoin(base_url, url.strip())
     return None
 
-# French month names -> number (lowercase)
-FRENCH_MONTHS = {
-    'janvier': '01', 'février': '02', 'fevrier': '02', 'mars': '03', 'avril': '04', 'mai': '05', 'juin': '06',
-    'juillet': '07', 'août': '08', 'aout': '08', 'septembre': '09', 'octobre': '10', 'novembre': '11', 'décembre': '12', 'decembre': '12'
-}
+#-------------------------------------------------------------------------------------------------------------------
 
-def parse_french_date(text):
-    """
-    Try to parse French dates and return AAAAMMJJ format.
-    Handles formats like: 'Publié le 28 août 2025 à 11h05' -> '20250828'
-    """
-    if not text:
+def convertir_date_francaise(texte_date):
+    """Convertit une date française en format AAAAMMJJ"""
+    if not texte_date:
         return None
     
-    # Clean the text
-    text = text.strip()
+    mois_francais = {
+        'janvier': '01', 'février': '02', 'fevrier': '02', 'mars': '03', 
+        'avril': '04', 'mai': '05', 'juin': '06', 'juillet': '07', 
+        'août': '08', 'aout': '08', 'septembre': '09', 'octobre': '10', 
+        'novembre': '11', 'décembre': '12', 'decembre': '12'
+    }
     
-    # Try to find pattern day month year
-    m = re.search(r'(\d{1,2})\s+([^\s,]+)\s+(\d{4})', text, flags=re.IGNORECASE)
-    if m:
-        day = int(m.group(1))
-        month_name = m.group(2).lower()
-        year = int(m.group(3))
-        month = FRENCH_MONTHS.get(month_name)
-        if month:
-            return f"{year:04d}{month}{day:02d}"
+    texte_date = texte_date.strip()
     
-    # Try to find ISO date format
-    iso_match = re.search(r'(\d{4})-(\d{2})-(\d{2})', text)
+    # Cherche le format "jour mois année"
+    match = re.search(r'(\d{1,2})\s+([^\s,]+)\s+(\d{4})', texte_date, flags=re.IGNORECASE)
+    if match:
+        jour = int(match.group(1))
+        nom_mois = match.group(2).lower()
+        annee = int(match.group(3))
+        numero_mois = mois_francais.get(nom_mois)
+        if numero_mois:
+            return f"{annee:04d}{numero_mois}{jour:02d}"
+    
+    # Cherche le format ISO
+    iso_match = re.search(r'(\d{4})-(\d{2})-(\d{2})', texte_date)
     if iso_match:
         return f"{iso_match.group(1)}{iso_match.group(2)}{iso_match.group(3)}"
     
-    # Fallback: try dateutil parser
+    # Dernière tentative avec le parseur automatique
     try:
-        dt = dateutil_parser.parse(text, dayfirst=True, fuzzy=True)
+        dt = dateutil_parser.parse(texte_date, dayfirst=True, fuzzy=True)
         return dt.strftime("%Y%m%d")
-    except Exception:
+    except:
         return None
 
+#-------------------------------------------------------------------------------------------------------------------
 
-def clean_text(text):
-    """Clean and normalize text content."""
-    if not text:
-        return ""
-    
-    # Remove extra whitespace and normalize
-    text = re.sub(r'\s+', ' ', text.strip())
-    # Remove special characters that might cause issues
-    text = re.sub(r'[\u00A0\u2000-\u200B\u2028\u2029]', ' ', text)
-    return text.strip()
-
-
-# --- Main scraping function ---
-
-def scrape_article(url, session=None, verbose=False):
+def scraper_article_bdm(url, session=None, verbose=False):
     """
-    Scrape a BDM article and return a dict with required fields.
-    Returns: title, thumbnail, sommaire, subcategory, summary, date (AAAAMMJJ),
-    author, content, images, url
+    Scrape un article du Blog du Modérateur
+    Retourne toutes les infos demandées dans le TP
     """
     if session is None:
         session = requests.Session()
     
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
     
     try:
-        r = session.get(url, headers=headers, timeout=15)
-        r.raise_for_status()
+        response = session.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
     except requests.RequestException as e:
         if verbose:
-            print(f"Error fetching {url}: {e}")
+            print(f"Impossible de charger {url}: {e}")
         return None
     
-    base_url = r.url
-    soup = BeautifulSoup(r.text, "html.parser")
+    base_url = response.url
+    soup = BeautifulSoup(response.text, "html.parser")
 
-    # Remove script and style elements
+    # Supprimer les scripts et styles pour avoir un contenu propre
     for script in soup(["script", "style"]):
         script.decompose()
 
-    # Locate main article container
+    # Trouver la zone principale de l'article
     article = soup.find("article")
-    if not article:
-        article = soup.find("div", {"class": re.compile(r'(entry-content|post|article|article-wrapper|single-post)', re.I)})
     if not article:
         article = soup.find("main")
     if not article:
         article = soup.find("body")
 
-    # --- Title ---
-    title = None
-    # Try h1 first (most likely article title)
-    title_tag = soup.find('h1')
-    if title_tag:
-        title = clean_text(title_tag.get_text())
+    # 1. TITRE
+    titre = None
+    h1 = soup.find('h1')
+    if h1:
+        titre = nettoyer_texte(h1.get_text())
     
-    # Fallback: try meta title or og:title
-    if not title:
-        meta_title = soup.find("meta", property="og:title") or soup.find("title")
+    if not titre:
+        meta_title = soup.find("meta", property="og:title")
         if meta_title:
-            content = meta_title.get("content") or meta_title.get_text()
-            if content:
-                title = clean_text(content)
+            titre = nettoyer_texte(meta_title.get("content"))
 
-    # --- Thumbnail ---
+    # 2. IMAGE MINIATURE
     thumbnail = None
-    # Try meta og:image first
     meta_og = soup.find("meta", property="og:image")
     if meta_og and meta_og.get("content"):
         thumbnail = urljoin(base_url, meta_og["content"])
     
-    # Try featured image or first figure
-    if not thumbnail:
-        # Look for featured image classes
-        featured_img = soup.find("img", class_=re.compile(r'(featured|hero|main|thumbnail)', re.I))
-        if featured_img:
-            thumbnail = _get_img_url(featured_img, base_url)
-    
-    # Try first figure/img in article
     if not thumbnail and article:
-        fig = article.find("figure")
-        if fig:
-            img = fig.find("img")
-            if img:
-                thumbnail = _get_img_url(img, base_url)
-        
-        # Fallback: first image in article
-        if not thumbnail:
-            first_img = article.find("img")
-            if first_img:
-                thumbnail = _get_img_url(first_img, base_url)
+        img_principale = article.find("img")
+        if img_principale:
+            thumbnail = extraire_url_image(img_principale, base_url)
 
-    # --- Sommaire (Table of Contents) ---
+    # 3. SOMMAIRE
     sommaire = []
-    # Look for explicit sommaire section
-    toc_headers = soup.find_all(lambda tag: tag.name in ['h2', 'h3', 'h4', 'div', 'p', 'span'] 
-                               and re.search(r'sommaire|table.?des.?matières|plan.?de.?l.?article', tag.get_text(), re.I))
+    # Chercher un titre "Sommaire" suivi d'une liste
+    titres_sommaire = soup.find_all(lambda tag: tag.name in ['h2', 'h3', 'div'] 
+                                   and 'sommaire' in tag.get_text().lower())
     
-    if toc_headers:
-        for toc_header in toc_headers:
-            # Find next list after sommaire header
-            next_list = toc_header.find_next(['ol', 'ul'])
-            if next_list:
-                for li in next_list.find_all('li'):
-                    txt = clean_text(li.get_text())
-                    if txt and len(txt) > 2:  # avoid single characters
-                        sommaire.append(txt)
-                break  # Take first valid sommaire found
-    
-    # Alternative: look for navigation with table-of-contents class
-    if not sommaire:
-        toc_nav = soup.find(['nav', 'div'], class_=re.compile(r'(toc|table-of-contents|sommaire)', re.I))
-        if toc_nav:
-            for item in toc_nav.find_all(['li', 'a']):
-                txt = clean_text(item.get_text())
-                if txt and len(txt) > 2:
-                    sommaire.append(txt)
+    for titre_som in titres_sommaire:
+        liste = titre_som.find_next(['ol', 'ul'])
+        if liste:
+            for item in liste.find_all('li'):
+                texte = nettoyer_texte(item.get_text())
+                if texte and len(texte) > 2:
+                    sommaire.append(texte)
+            break
 
-    # --- Subcategory ---
-    subcategory = None
-    # Try breadcrumbs first
-    breadcrumb = soup.find(['nav', 'div', 'ol', 'ul'], class_=re.compile(r'(breadcrumb|breadcrumbs|fil.?ariane)', re.I))
+    # 4. SOUS-CATÉGORIE
+    sous_categorie = None
+    # Chercher dans les breadcrumbs (fil d'Ariane)
+    breadcrumb = soup.find(['nav', 'div'], class_=re.compile(r'breadcrumb', re.I))
     if breadcrumb:
-        links = breadcrumb.find_all('a')
-        # Get the last category before the article title
-        if len(links) >= 2:
-            subcategory = clean_text(links[-2].get_text())
-        elif links:
-            subcategory = clean_text(links[-1].get_text())
+        liens = breadcrumb.find_all('a')
+        if len(liens) >= 2:
+            sous_categorie = nettoyer_texte(liens[-2].get_text())
     
-    # Try meta article:section
-    if not subcategory:
-        meta_section = soup.find("meta", {"name": "article:section"}) or soup.find("meta", {"property": "article:section"})
-        if meta_section and meta_section.get("content"):
-            subcategory = clean_text(meta_section["content"])
-    
-    # Try category links near header
-    if not subcategory:
-        cat_links = soup.find_all("a", href=re.compile(r'/(categor|tag|theme)/', re.I))
-        if cat_links:
-            subcategory = clean_text(cat_links[0].get_text())
+    # Alternative: meta article:section
+    if not sous_categorie:
+        meta_section = soup.find("meta", {"name": "article:section"})
+        if meta_section:
+            sous_categorie = nettoyer_texte(meta_section.get("content"))
 
-    # --- Summary/Chapô ---
-    summary = None
-    # Look for elements with intro/lead/chapo classes
-    summary_candidates = soup.find_all(['p', 'div'], class_=re.compile(r'(chapo|lead|intro|excerpt|summary|extrait)', re.I))
-    if summary_candidates:
-        summary = clean_text(summary_candidates[0].get_text())
+    # 5. RÉSUMÉ/CHAPÔ
+    resume = None
+    # Chercher les éléments avec des classes typiques de résumé
+    resume_elem = soup.find(['p', 'div'], class_=re.compile(r'(chapo|lead|intro|excerpt)', re.I))
+    if resume_elem:
+        resume = nettoyer_texte(resume_elem.get_text())
     
     # Alternative: meta description
-    if not summary:
-        meta_desc = soup.find("meta", {"name": "description"}) or soup.find("meta", property="og:description")
-        if meta_desc and meta_desc.get("content"):
-            summary = clean_text(meta_desc["content"])
-    
-    # Fallback: first paragraph after title (if reasonable length)
-    if not summary and title_tag:
-        next_p = title_tag.find_next('p')
-        if next_p:
-            p_text = clean_text(next_p.get_text())
-            if 50 <= len(p_text) <= 300:  # reasonable summary length
-                summary = p_text
+    if not resume:
+        meta_desc = soup.find("meta", {"name": "description"})
+        if meta_desc:
+            resume = nettoyer_texte(meta_desc.get("content"))
 
-    # --- Date ---
+    # 6. DATE DE PUBLICATION
     date_aaaammjj = None
-    date_text = None
+    texte_date = None
     
-    # Look for time element
+    # Chercher l'élément time
     time_tag = soup.find('time')
     if time_tag:
-        date_text = time_tag.get('datetime') or clean_text(time_tag.get_text())
+        texte_date = time_tag.get('datetime') or nettoyer_texte(time_tag.get_text())
     
-    # Look for publication date text patterns
-    if not date_text:
-        pub_patterns = [
-            r'Publié\s+le?\s+([^|]+)',
-            r'Published\s+on\s+([^|]+)',
-            r'(\d{1,2}\s+\w+\s+\d{4})',
-            r'(\d{4}-\d{2}-\d{2})'
-        ]
-        
-        for pattern in pub_patterns:
-            pub_match = re.search(pattern, soup.get_text(), re.I)
-            if pub_match:
-                date_text = pub_match.group(1)
-                break
+    # Chercher "Publié le..."
+    if not texte_date:
+        pub_match = re.search(r'Publié\s+le?\s+([^|]+)', soup.get_text(), re.I)
+        if pub_match:
+            texte_date = pub_match.group(1)
     
-    # Parse date to AAAAMMJJ format
-    if date_text:
-        date_aaaammjj = parse_french_date(date_text)
+    if texte_date:
+        date_aaaammjj = convertir_date_francaise(texte_date)
 
-    # --- Author ---
-    author = None
-    # Look for rel="author" links
-    author_link = soup.find('a', rel='author')
-    if author_link:
-        author = clean_text(author_link.get_text())
+    # 7. AUTEUR
+    auteur = None
+    # Chercher les liens avec rel="author"
+    lien_auteur = soup.find('a', rel='author')
+    if lien_auteur:
+        auteur = nettoyer_texte(lien_auteur.get_text())
     
-    # Look for author classes
-    if not author:
-        author_elem = soup.find(['span', 'div', 'p'], class_=re.compile(r'(author|auteur|byline|writer)', re.I))
-        if author_elem:
-            author = clean_text(author_elem.get_text())
-    
-    # Look for author in byline/meta information
-    if not author:
-        byline = soup.find(lambda tag: tag and re.search(r'(par|by)\s+([^|,\n]+)', tag.get_text(), re.I))
-        if byline:
-            author_match = re.search(r'(par|by)\s+([^|,\n]+)', byline.get_text(), re.I)
-            if author_match:
-                author = clean_text(author_match.group(2))
+    # Alternative: chercher les classes "author"
+    if not auteur:
+        elem_auteur = soup.find(['span', 'div'], class_=re.compile(r'author', re.I))
+        if elem_auteur:
+            auteur = nettoyer_texte(elem_auteur.get_text())
 
-    # --- Content ---
-    content_text = ""
+    # 8. CONTENU DE L'ARTICLE
+    contenu_texte = ""
     if article:
-        # Find main content area
-        content_area = article.find(['div', 'section'], class_=re.compile(r'(entry-content|post-content|article-content|content|post-body)', re.I))
-        if not content_area:
-            content_area = article
+        # Trouver la zone de contenu principal
+        zone_contenu = article.find(['div'], class_=re.compile(r'(content|post-content)', re.I))
+        if not zone_contenu:
+            zone_contenu = article
         
-        # Extract paragraphs and headings
-        paragraphs = []
-        for elem in content_area.find_all(['p', 'h2', 'h3', 'h4', 'h5', 'h6']):
-            # Skip elements that are part of navigation, ads, or metadata
-            if elem.find_parent(['nav', 'aside']) or elem.find_parent(class_=re.compile(r'(nav|sidebar|ad|meta|social)', re.I)):
+        # Extraire les paragraphes et titres
+        paragraphes = []
+        for elem in zone_contenu.find_all(['p', 'h2', 'h3', 'h4', 'h5', 'h6']):
+            # Ignorer les éléments de navigation ou publicité
+            if elem.find_parent(['nav', 'aside']):
                 continue
             
-            txt = clean_text(elem.get_text())
-            if txt and len(txt) > 10:  # avoid very short fragments
+            texte = nettoyer_texte(elem.get_text())
+            if texte and len(texte) > 10:
                 if elem.name.startswith('h'):
-                    paragraphs.append(f"\n{txt}\n")  # Add spacing around headings
+                    paragraphes.append(f"\n{texte}\n")  # Espacer les titres
                 else:
-                    paragraphs.append(txt)
+                    paragraphes.append(texte)
         
-        content_text = "\n\n".join(paragraphs).strip()
-        # Clean up multiple newlines
-        content_text = re.sub(r'\n{3,}', '\n\n', content_text)
+        contenu_texte = "\n\n".join(paragraphes).strip()
+        contenu_texte = re.sub(r'\n{3,}', '\n\n', contenu_texte)  # Nettoyer les sauts de ligne
 
-    # --- Images ---
+    # 9. IMAGES DE L'ARTICLE
     images = []
     if article:
-        # Find images in content area
-        content_area = article.find(['div', 'section'], class_=re.compile(r'(entry-content|post-content|article-content|content)', re.I))
-        if not content_area:
-            content_area = article
+        zone_contenu = article.find(['div'], class_=re.compile(r'content', re.I)) or article
         
-        for img in content_area.find_all('img'):
-            img_url = _get_img_url(img, base_url)
-            if not img_url:
+        for img in zone_contenu.find_all('img'):
+            url_img = extraire_url_image(img, base_url)
+            if not url_img:
                 continue
             
-            # Skip very small images (likely icons or decorations)
-            width = img.get('width')
-            height = img.get('height')
-            if width and height:
+            # Ignorer les petites images (probablement des icônes)
+            largeur = img.get('width')
+            hauteur = img.get('height')
+            if largeur and hauteur:
                 try:
-                    if int(width) < 100 or int(height) < 100:
+                    if int(largeur) < 100 or int(hauteur) < 100:
                         continue
-                except (ValueError, TypeError):
+                except:
                     pass
             
-            # Get caption
-            caption = None
-            # Check parent figure for figcaption
-            parent_fig = img.find_parent('figure')
-            if parent_fig:
-                figcaption = parent_fig.find('figcaption')
+            # Récupérer la légende
+            legende = None
+            # Chercher dans figcaption
+            parent_figure = img.find_parent('figure')
+            if parent_figure:
+                figcaption = parent_figure.find('figcaption')
                 if figcaption:
-                    caption = clean_text(figcaption.get_text())
+                    legende = nettoyer_texte(figcaption.get_text())
             
-            # Fallback to alt or title attributes
-            if not caption:
-                caption = clean_text(img.get('alt', '')) or clean_text(img.get('title', ''))
+            # Alternative: attributs alt ou title
+            if not legende:
+                legende = nettoyer_texte(img.get('alt', '')) or nettoyer_texte(img.get('title', ''))
             
-            # Skip if this image is the same as thumbnail
-            if img_url != thumbnail:
+            # Éviter les doublons avec le thumbnail
+            if url_img != thumbnail:
                 images.append({
-                    "url": img_url,
-                    "caption": caption or ""
+                    "url": url_img,
+                    "caption": legende or ""
                 })
 
-    # --- Compose result ---
-    result = {
+    # Construire le résultat final
+    resultat = {
         "url": base_url,
-        "title": title or "",
+        "title": titre or "",
         "thumbnail": thumbnail or "",
         "sommaire": sommaire,
-        "subcategory": subcategory or "",
-        "summary": summary or "",
+        "subcategory": sous_categorie or "",
+        "summary": resume or "",
         "date": date_aaaammjj or "",
-        "author": author or "",
-        "content": content_text,
+        "author": auteur or "",
+        "content": contenu_texte,
         "images": images,
         "scraped_at": datetime.utcnow().isoformat()
     }
 
     if verbose:
-        print(f"Scraped: {result['title'][:50]}...")
-        print(f"Date: {result['date']}, Author: {result['author']}")
-        print(f"Images: {len(result['images'])}, Sommaire items: {len(result['sommaire'])}")
+        print(f"Scrapé: {resultat['title'][:50]}...")
+        print(f"{resultat['date']} | 👤 {resultat['author']} | {len(resultat['images'])} images")
     
-    return result
+    return resultat
 
+#-------------------------------------------------------------------------------------------------------------------
 
-# --- Save to MongoDB ---
-def save_article_to_mongo(article_dict):
-    """
-    Insert or update article into MongoDB collection 'articles'.
-    Uses article['url'] as unique key.
-    """
-    if not article_dict or "url" not in article_dict or not article_dict["url"]:
-        raise ValueError("Article must contain valid 'url' to be saved")
+def sauvegarder_en_base(article):
+    """Sauvegarde un article dans MongoDB"""
+    if not article or not article.get("url"):
+        raise ValueError("L'article doit avoir une URL pour être sauvegardé")
     
     try:
-        # Upsert by url
-        result = articles_col.update_one(
-            {"url": article_dict["url"]},
-            {"$set": article_dict},
+        resultat = articles_col.update_one(
+            {"url": article["url"]},
+            {"$set": article},
             upsert=True
         )
-        return result
+        return resultat
     except Exception as e:
-        print(f"Error saving to MongoDB: {e}")
+        print(f"Erreur lors de la sauvegarde: {e}")
         raise
 
+#-------------------------------------------------------------------------------------------------------------------
 
-# --- Query functions ---
-def get_articles_by_category(category=None, subcategory=None, limit=100):
-    """
-    Return articles matching category or subcategory.
-    If both None -> return all (capped by limit).
-    """
-    query = {}
+def chercher_articles_par_categorie(categorie=None, sous_categorie=None, limite=100):
+    """Trouve les articles d'une catégorie ou sous-catégorie"""
+    requete = {}
     
-    if category:
-        query["$or"] = [
-            {"subcategory": {"$regex": f"^{re.escape(category)}$", "$options": "i"}},
-            {"category": {"$regex": f"^{re.escape(category)}$", "$options": "i"}}
-        ]
+    if categorie:
+        requete["subcategory"] = {"$regex": f"^{re.escape(categorie)}$", "$options": "i"}
     
-    if subcategory:
-        subcat_condition = {"subcategory": {"$regex": f"^{re.escape(subcategory)}$", "$options": "i"}}
-        if "$or" in query:
-            query = {"$and": [query, subcat_condition]}
-        else:
-            query = subcat_condition
+    if sous_categorie:
+        requete["subcategory"] = {"$regex": f"^{re.escape(sous_categorie)}$", "$options": "i"}
 
     try:
-        cursor = articles_col.find(query).limit(limit).sort("scraped_at", -1)
+        cursor = articles_col.find(requete).limit(limite).sort("scraped_at", -1)
         return list(cursor)
     except Exception as e:
-        print(f"Error querying MongoDB: {e}")
+        print(f"Erreur lors de la recherche: {e}")
         return []
 
+#-------------------------------------------------------------------------------------------------------------------
 
-def search_articles(title_substring=None, author=None, date_start=None, date_end=None, 
-                   category=None, subcategory=None, limit=100):
-    """
-    Advanced search function for articles.
-    date_start/date_end should be in AAAAMMJJ format.
-    """
-    query = {}
+def recherche_avancee(titre_contient=None, auteur=None, date_debut=None, date_fin=None, 
+                     categorie=None, sous_categorie=None, limite=100):
+    """Recherche avancée dans les articles"""
+    requete = {}
     
-    if title_substring:
-        query["title"] = {"$regex": re.escape(title_substring), "$options": "i"}
+    if titre_contient:
+        requete["title"] = {"$regex": re.escape(titre_contient), "$options": "i"}
     
-    if author:
-        query["author"] = {"$regex": re.escape(author), "$options": "i"}
+    if auteur:
+        requete["author"] = {"$regex": re.escape(auteur), "$options": "i"}
     
-    if date_start or date_end:
-        date_query = {}
-        if date_start:
-            date_query["$gte"] = date_start
-        if date_end:
-            date_query["$lte"] = date_end
-        query["date"] = date_query
+    if date_debut or date_fin:
+        date_requete = {}
+        if date_debut:
+            date_requete["$gte"] = date_debut
+        if date_fin:
+            date_requete["$lte"] = date_fin
+        requete["date"] = date_requete
     
-    if category:
-        query["$or"] = query.get("$or", []) + [
-            {"subcategory": {"$regex": re.escape(category), "$options": "i"}}
-        ]
-    
-    if subcategory:
-        subcat_condition = {"subcategory": {"$regex": re.escape(subcategory), "$options": "i"}}
-        if "$or" in query:
-            query = {"$and": [query, subcat_condition]}
-        else:
-            query.update(subcat_condition)
+    if sous_categorie:
+        requete["subcategory"] = {"$regex": re.escape(sous_categorie), "$options": "i"}
 
     try:
-        cursor = articles_col.find(query).limit(limit).sort("date", -1)
+        cursor = articles_col.find(requete).limit(limite).sort("date", -1)
         return list(cursor)
     except Exception as e:
-        print(f"Error in search: {e}")
+        print(f"Erreur dans la recherche: {e}")
         return []
 
-
-# exemple de comment l'utiliser
+# Test du script
 if __name__ == "__main__":
-    # Test with a BDM article
-    TEST_URL = "https://www.blogdumoderateur.com/100-outils-ia-plus-utilises-monde-ete-2025/"
+    print("Test du scraper avec le Blog du Modérateur")
     
-    print(f"Scraping: {TEST_URL}")
-    data = scrape_article(TEST_URL, verbose=True)
+    url_test = "https://www.blogdumoderateur.com/100-outils-ia-plus-utilises-monde-ete-2025/"
     
-    if data:
-        print(f"\nTitle: {data['title']}")
-        print(f"Date: {data['date']}")
-        print(f"Author: {data['author']}")
-        print(f"Subcategory: {data['subcategory']}")
-        print(f"Summary: {data['summary'][:100]}...")
-        print(f"Content length: {len(data['content'])} chars")
-        print(f"Images: {len(data['images'])}")
-        print(f"Sommaire items: {len(data['sommaire'])}")
+    print(f"Scraping: {url_test}")
+    donnees = scraper_article_bdm(url_test, verbose=True)
+    
+    if donnees:
+        print(f"\n📋 Résultats:")
+        print(f"Titre: {donnees['title']}")
+        print(f"Date: {donnees['date']}")
+        print(f"Auteur: {donnees['author']}")
+        print(f"Catégorie: {donnees['subcategory']}")
+        print(f"Résumé: {donnees['summary'][:100]}...")
+        print(f"Contenu: {len(donnees['content'])} caractères")
+        print(f"Images: {len(donnees['images'])}")
+        print(f"Sommaire: {len(donnees['sommaire'])} éléments")
         
-        # je met dans mogodb 
+        # Sauvegarder
         try:
-            save_result = save_article_to_mongo(data)
-            print(f"Saved to MongoDB: {save_result.acknowledged}")
+            resultat_sauvegarde = sauvegarder_en_base(donnees)
+            print(f"Sauvegardé: {resultat_sauvegarde.acknowledged}")
         except Exception as e:
-            print(f"Error saving: {e}")
+            print(f"Erreur sauvegarde: {e}")
         
-        # test
-        print(f"\nQuerying articles by subcategory '{data['subcategory']}':")
-        found_articles = get_articles_by_category(subcategory=data['subcategory'])
-        print(f"Found {len(found_articles)} articles")
-        for article in found_articles[:3]:
-            print(f"- {article.get('title', 'No title')} ({article.get('date', 'No date')})")
+        # Tester la recherche
+        print(f"\n🔍 Test recherche par catégorie '{donnees['subcategory']}':")
+        articles_trouves = chercher_articles_par_categorie(sous_categorie=donnees['subcategory'])
+        print(f"Trouvé {len(articles_trouves)} articles")
+        
+        for article in articles_trouves[:3]:
+            print(f"- {article.get('title', 'Sans titre')} ({article.get('date', 'Sans date')})")
     else:
-        print("Failed to scrape article")
+        print("echec")
