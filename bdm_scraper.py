@@ -156,7 +156,8 @@ def scraper_article_bdm(url, session=None, verbose=False):
 
     # 4. SOUS-CATÉGORIE
     sous_categorie = None
-    # Chercher dans les breadcrumbs (fil d'Ariane)
+
+    # Chercher dans les breadcrumbs recup pas tout compris
     breadcrumb = soup.find(['nav', 'div'], class_=re.compile(r'breadcrumb', re.I))
     if breadcrumb:
         liens = breadcrumb.find_all('a')
